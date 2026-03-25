@@ -18,7 +18,7 @@ func TestExtractJellyfinItemID(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := extractJellyfinItemID(tt.path); got != tt.want {
-				t.Fatalf("extractJellyfinItemID(%s) = %s, want %s", tt.path, got, tt.want)
+				t.Errorf("extractJellyfinItemID(%s) = %s, want %s", tt.path, got, tt.want)
 			}
 		})
 	}

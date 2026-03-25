@@ -197,6 +197,7 @@ func (handler *JellyfinHandler) VideosHandler(ctx *gin.Context) {
 	itemID := extractJellyfinItemID(ctx.Request.URL.Path)
 	lookupID := mediaSourceID
 	if itemID != "" {
+		// Jellyfin 的播放路径中包含 itemId，当查询参数中的 mediasourceId 与路径中的 itemId 不一致时，优先使用路径中的 itemId 以避免查不到条目导致的空结果
 		lookupID = itemID
 	}
 
@@ -240,7 +241,9 @@ func (handler *JellyfinHandler) VideosHandler(ctx *gin.Context) {
 			logging.Warning("媒体源缺少必要字段，跳过当前媒体源")
 			continue
 		}
-		if mediaSourceID != "" && *mediasource.ID != mediaSourceID { // EmbyServer >= 4.9 返回的ID带有前缀mediasource_
+		// Jellyfin 某些请求可能不携带 mediasourceid，此时兜底选择第一个可用的媒体源
+		matchedMediaSource := mediaSourceID == "" || *mediasource.ID == mediaSourceID // EmbyServer >= 4.9 返回的ID带有前缀mediasource_
+		if !matchedMediaSource {
 			continue
 		}
 		foundMediaSource = true
@@ -273,7 +276,11 @@ func (handler *JellyfinHandler) VideosHandler(ctx *gin.Context) {
 	}
 
 	if !foundMediaSource {
-		logging.Warningf("未找到匹配的媒体源，MediaSourceId: %s", mediaSourceID)
+		if mediaSourceID == "" {
+			logging.Warning("未找到可用的媒体源，转发至上游服务器")
+		} else {
+			logging.Warningf("未找到匹配的媒体源，MediaSourceId: %s", mediaSourceID)
+		}
 		handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
 		return
 	}
