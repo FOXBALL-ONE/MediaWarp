@@ -123,6 +123,10 @@ func (handler *JellyfinHandler) ModifyPlaybackInfo(rw *http.Response) error {
 	}
 
 	for index, mediasource := range playbackInfoResponse.MediaSources {
+		if mediasource.ID == nil {
+			logging.Warning("MediaSource ID 为空，跳过处理")
+			continue
+		}
 		startTime := time.Now()
 		logging.Debug("请求 ItemsServiceQueryItem：" + *mediasource.ID)
 		itemResponse, err := handler.client.ItemsServiceQueryItem(*mediasource.ID, 1, "Path,MediaSources") // 查询 item 需要去除前缀仅保留数字部分
@@ -130,7 +134,15 @@ func (handler *JellyfinHandler) ModifyPlaybackInfo(rw *http.Response) error {
 			logging.Warning("请求 ItemsServiceQueryItem 失败：", err)
 			continue
 		}
+		if len(itemResponse.Items) == 0 {
+			logging.Warning("ItemsServiceQueryItem 返回空结果，跳过处理")
+			continue
+		}
 		item := itemResponse.Items[0]
+		if item.Path == nil {
+			logging.Warning("ItemsServiceQueryItem 返回的 item.Path 为空，跳过处理")
+			continue
+		}
 		strmFileType, opt := recgonizeStrmFileType(*item.Path)
 		bsePath := "MediaSources." + strconv.Itoa(index) + "."
 		switch strmFileType {
@@ -182,15 +194,32 @@ func (handler *JellyfinHandler) VideosHandler(ctx *gin.Context) {
 	}
 
 	mediaSourceID := ctx.Query("mediasourceid")
-	logging.Debugf("请求 ItemsServiceQueryItem：%s", mediaSourceID)
-	itemResponse, err := handler.client.ItemsServiceQueryItem(mediaSourceID, 1, "Path,MediaSources") // 查询 item 需要去除前缀仅保留数字部分
+	itemID := extractJellyfinItemID(ctx.Request.URL.Path)
+	lookupID := mediaSourceID
+	if itemID != "" {
+		lookupID = itemID
+	}
+
+	logging.Debugf("请求 ItemsServiceQueryItem：%s (MediaSourceId: %s)", lookupID, mediaSourceID)
+	itemResponse, err := handler.client.ItemsServiceQueryItem(lookupID, 1, "Path,MediaSources") // 查询 item 需要去除前缀仅保留数字部分
 	if err != nil {
 		logging.Warning("请求 ItemsServiceQueryItem 失败：", err)
 		handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
 		return
 	}
 
+	if len(itemResponse.Items) == 0 {
+		logging.Warning("ItemsServiceQueryItem 返回空结果，转发至上游服务器")
+		handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+		return
+	}
+
 	item := itemResponse.Items[0]
+	if item.Path == nil {
+		logging.Warning("ItemsServiceQueryItem 返回的 item.Path 为空，转发至上游服务器")
+		handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+		return
+	}
 
 	if !strings.HasSuffix(strings.ToLower(*item.Path), ".strm") { // 不是 Strm 文件
 		logging.Debugf("播放本地视频：%s，不进行处理", *item.Path)
@@ -199,31 +228,65 @@ func (handler *JellyfinHandler) VideosHandler(ctx *gin.Context) {
 	}
 
 	strmFileType, opt := recgonizeStrmFileType(*item.Path)
+	if len(item.MediaSources) == 0 {
+		logging.Warning("未找到媒体源，转发至上游服务器")
+		handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+		return
+	}
+
+	foundMediaSource := false
 	for _, mediasource := range item.MediaSources {
-		if *mediasource.ID == mediaSourceID { // EmbyServer >= 4.9 返回的ID带有前缀mediasource_
-			switch strmFileType {
-			case constants.HTTPStrm:
-				if *mediasource.Protocol == jellyfin.HTTP {
-					ctx.Redirect(http.StatusFound, handler.httpStrmHandler(*mediasource.Path, ctx.Request.UserAgent()))
-					return
-				}
-
-			case constants.AlistStrm: // 无需判断 *mediasource.Container 是否以Strm结尾，当 AlistStrm 存储的位置有对应的文件时，*mediasource.Container 会被设置为文件后缀
-				res, err := alistStrmHandler(*mediasource.Path, opt.(string), false)
-				if err != nil {
-					logging.Warningf("获取 AlistStrm 重定向 URL 失败:%#v", err)
-					handler.ReverseProxy(ctx.Writer, ctx.Request)
-					return
-				}
-				ctx.Redirect(http.StatusFound, res.url)
-				return
-
-			case constants.UnknownStrm:
-				handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+		if mediasource.ID == nil || mediasource.Path == nil {
+			logging.Warning("媒体源缺少必要字段，跳过当前媒体源")
+			continue
+		}
+		if mediaSourceID != "" && *mediasource.ID != mediaSourceID { // EmbyServer >= 4.9 返回的ID带有前缀mediasource_
+			continue
+		}
+		foundMediaSource = true
+		if mediasource.Protocol == nil {
+			logging.Warning("媒体源协议为空，转发至上游服务器")
+			handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+			return
+		}
+		switch strmFileType {
+		case constants.HTTPStrm:
+			if *mediasource.Protocol == jellyfin.HTTP {
+				ctx.Redirect(http.StatusFound, handler.httpStrmHandler(*mediasource.Path, ctx.Request.UserAgent()))
 				return
 			}
+
+		case constants.AlistStrm: // 无需判断 *mediasource.Container 是否以Strm结尾，当 AlistStrm 存储的位置有对应的文件时，*mediasource.Container 会被设置为文件后缀
+			res, err := alistStrmHandler(*mediasource.Path, opt.(string), false)
+			if err != nil {
+				logging.Warningf("获取 AlistStrm 重定向 URL 失败:%#v", err)
+				handler.ReverseProxy(ctx.Writer, ctx.Request)
+				return
+			}
+			ctx.Redirect(http.StatusFound, res.url)
+			return
+
+		case constants.UnknownStrm:
+			handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+			return
 		}
 	}
+
+	if !foundMediaSource {
+		logging.Warningf("未找到匹配的媒体源，MediaSourceId: %s", mediaSourceID)
+		handler.proxy.ServeHTTP(ctx.Writer, ctx.Request)
+		return
+	}
+}
+
+func extractJellyfinItemID(p string) string {
+	segments := strings.Split(strings.Trim(p, "/"), "/")
+	for i, segment := range segments {
+		if strings.EqualFold(segment, "videos") && i+1 < len(segments) {
+			return segments[i+1]
+		}
+	}
+	return ""
 }
 
 // 修改首页函数
